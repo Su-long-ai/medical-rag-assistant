@@ -1,325 +1,219 @@
-import os
-import logging
-from functools import lru_cache
+from __future__ import annotations
 
+import json
+import logging
+import os
+from functools import lru_cache
+from typing import Any
+
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_deepseek import ChatDeepSeek
-from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
-from langchain_core.tools import Tool
 from langchain_openai import ChatOpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from neo4j import GraphDatabase
+from tavily import TavilyClient
 from zhipuai import ZhipuAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain.schema import Document
 
 from .config import config
+
+logger = logging.getLogger(__name__)
+
+
+def _required(value: str | None, label: str) -> str:
+    if not value:
+        raise RuntimeError(f"{label} is not configured")
+    return value
 
 
 @lru_cache()
 def get_llm():
-    """获取 DeepSeek LLM 实例"""
-    return  ChatDeepSeek(
-        api_key=os.getenv("DEEPSEEK_API_KEY"),
-        model="deepseek-chat",
-        temperature=0.1,
-    )
+    """Create the configured chat model without embedding credentials in code."""
 
-"""
-ChatDeepSeek(
-        api_key=os.getenv("DEEPSEEK_API_KEY"),
-        model="deepseek-chat",
-        temperature=0.1,
-    )
+    if config.LLM_PROVIDER == "deepseek":
+        key = _required(config.DEEPSEEK_API_KEY or config.LLM_API_KEY, "DeepSeek API key")
+        return ChatDeepSeek(api_key=key, model=config.LLM_MODEL, temperature=0.1)
 
-ChatOpenAI(
-        base_url="https://api.moonshot.cn/v1",  # 末尾别留空格
-        api_key=os.getenv("MOONSHOT_API_KEY"),  # 显式再传一次更保险
-        model="kimi-k2-0905-preview",
-        temperature=0.1,
-    )
-"""
+    if config.LLM_PROVIDER == "openai_compatible":
+        key = _required(config.LLM_API_KEY, "LLM_API_KEY")
+        base_url = _required(config.LLM_BASE_URL, "LLM_BASE_URL")
+        return ChatOpenAI(
+            base_url=base_url,
+            api_key=key,
+            model=config.LLM_MODEL,
+            temperature=0.1,
+        )
+
+    raise RuntimeError(f"Unsupported LLM_PROVIDER: {config.LLM_PROVIDER}")
 
 
 @lru_cache()
-def get_neo4j_graph():
-    """获取 Neo4j 图数据库连接"""
-    return Neo4jGraph(
-        url=config.NEO4J_URI,
-        username=config.NEO4J_USERNAME,
-        password=config.NEO4J_PASSWORD,
-        refresh_schema=True,
+def get_neo4j_driver():
+    if not config.ENABLE_GRAPH_TOOL:
+        raise RuntimeError("Knowledge-graph tool is disabled")
+    return GraphDatabase.driver(
+        config.NEO4J_URI,
+        auth=(config.NEO4J_USERNAME, _required(config.NEO4J_PASSWORD, "NEO4J_PASSWORD")),
     )
 
 
-@lru_cache()
-def get_graph_chain():
-    """获取图数据库查询链"""
-    from .agents.prompts import CYPHER_GENERATION_PROMPT
-
-    llm = get_llm()
-    graph = get_neo4j_graph()
-
-    return GraphCypherQAChain.from_llm(
-        llm=llm,
-        graph=graph,
-        allow_dangerous_requests=True,
-        verbose=True,
-        cypher_llm_kwargs={
-            "temperature": 0.1,
-        },
-        cypher_prompt_template=CYPHER_GENERATION_PROMPT
-    )
+_READ_ONLY_ENTITY_LOOKUP = """
+MATCH (n)
+WITH n, coalesce(n.name, n.title, n.label, '') AS display_name
+WHERE toLower(toString(display_name)) CONTAINS toLower($needle)
+OPTIONAL MATCH (n)-[r]-(m)
+RETURN labels(n) AS labels,
+       properties(n) AS entity,
+       type(r) AS relationship,
+       labels(m) AS neighbor_labels,
+       properties(m) AS neighbor
+LIMIT $limit
+"""
 
 
 def safe_graph_query(query_text: str) -> str:
-    """安全的图数据库查询包装器"""
+    """Run a parameterized read-only entity lookup through the official driver."""
+
+    if not config.ENABLE_GRAPH_TOOL:
+        return json.dumps({"status": "disabled", "results": []}, ensure_ascii=False)
+
+    needle = " ".join(str(query_text).split())[:160]
+
+    def _lookup(transaction):
+        records = transaction.run(_READ_ONLY_ENTITY_LOOKUP, needle=needle, limit=8)
+        return [record.data() for record in records]
+
     try:
-        chain = get_graph_chain()
-        result = chain.invoke({"query": query_text})
-        return result
-    except Exception as e:
-        error_msg = str(e)
-        print(f"Graph query error: {error_msg}")
-
-        # 如果是UNION错误，返回友好的错误信息
-        if "UNION" in error_msg and "same return column names" in error_msg:
-            return "抱歉，知识图谱查询遇到了技术问题。这通常是由于查询语法复杂导致的。请尝试更具体或更简单的问题，我会尽力使用我的医学知识来回答。"
-
-        # 其他Neo4j错误
-        elif "Neo4j" in error_msg or "Cypher" in error_msg:
-            return "知识图谱暂时不可用，但我可以基于我的医学知识来回答您的问题。请告诉我您想了解什么医疗信息？"
-
-        # 其他错误
-        else:
-            return f"查询过程中遇到问题：{error_msg}。让我尝试用其他方式回答您的问题。"
+        with get_neo4j_driver().session() as session:
+            rows = session.execute_read(_lookup)
+        return json.dumps({"status": "ok", "results": rows}, ensure_ascii=False, default=str)
+    except Exception:
+        logger.exception("Knowledge-graph lookup failed")
+        return json.dumps({"status": "unavailable", "results": []}, ensure_ascii=False)
 
 
 @lru_cache()
-def get_graph_tool():
-    """获取知识图谱查询工具"""
-    return Tool(
-        name="KnowledgeGraphQA",
-        func=safe_graph_query,
-        description="""使用知识图谱回答医疗相关问题。
-
-适用场景：
-- 查询疾病信息和症状
-- 查询治疗方法和药物信息
-- 查询医疗实体之间的关系
-- 医学知识的结构化查询
-
-使用建议：
-- 问题要具体明确
-- 一次只查询一个主要概念
-- 避免过于复杂的组合查询"""
-    )
+def get_tavily_client() -> TavilyClient:
+    if not config.ENABLE_WEB_SEARCH:
+        raise RuntimeError("Web search is disabled")
+    return TavilyClient(api_key=_required(config.TAVILY_API_KEY, "TAVILY_API_KEY"))
 
 
-@lru_cache()
-def get_tavily_search_tool():
-    """获取Tavily网络搜索工具"""
-    if not config.TAVILY_API_KEY:
-        # 如果没有配置API密钥，返回一个模拟工具
-        return Tool(
-            name="WebSearch",
-            func=lambda x: {"results": [], "error": "Tavily API密钥未配置，无法使用网络搜索功能"},
-            description="网络搜索工具（当前未配置API密钥）"
-        )
-
+def search_web(query: str) -> dict[str, Any]:
+    if not config.ENABLE_WEB_SEARCH:
+        return {"status": "disabled", "results": []}
     try:
-        search = TavilySearchResults(
-            api_key=config.TAVILY_API_KEY,
+        result = get_tavily_client().search(
+            query=query,
             max_results=5,
             search_depth="advanced",
             include_answer=True,
             include_raw_content=False,
-            include_domains=[],
-            exclude_domains=[]
         )
-
-        return Tool(
-            name="WebSearch",
-            func=search.run,
-            description="""使用网络搜索获取最新的医疗健康信息。
-
-适用场景：
-- 查询最新的医学研究进展
-- 搜索最新的药物信息和临床试验结果
-- 获取最新的医疗指南和专家建议
-- 查询特定疾病的最新治疗方法
-- 搜索医疗新闻和健康资讯
-
-使用建议：
-- 搜索词要具体且与医疗健康相关
-- 优先搜索权威医疗网站的内容
-- 注意信息的时效性和可靠性
-- 结合知识图谱信息进行综合判断"""
-        )
-    except Exception as e:
-        print(f"Failed to initialize Tavily search tool: {e}")
-        return Tool(
-            name="WebSearch",
-            func=lambda x: {"results": [], "error": f"网络搜索工具初始化失败: {str(e)}"},
-            description="网络搜索工具（初始化失败）"
-        )
+        return {"status": "ok", **result}
+    except Exception:
+        logger.exception("Web search failed")
+        return {"status": "unavailable", "results": []}
 
 
-class ZhipuEmbeddings:
-    """智谱AI嵌入模型封装"""
-
+class ZhipuEmbeddings(Embeddings):
     def __init__(self, api_key: str, model: str = "embedding-3"):
         self.client = ZhipuAI(api_key=api_key)
         self.model = model
 
-    def embed_documents(self, texts: list) -> list:
-        """批量嵌入文档"""
-        embeddings = []
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        embeddings: list[list[float]] = []
         for text in texts:
-            response = self.client.embeddings.create(
-                model=self.model,
-                input=text
-            )
+            response = self.client.embeddings.create(model=self.model, input=text)
             embeddings.append(response.data[0].embedding)
         return embeddings
 
-    def embed_query(self, text: str) -> list:
-        """嵌入单个查询"""
-        response = self.client.embeddings.create(
-            model=self.model,
-            input=text
-        )
+    def embed_query(self, text: str) -> list[float]:
+        response = self.client.embeddings.create(model=self.model, input=text)
         return response.data[0].embedding
 
 
 @lru_cache()
-def get_embedding_model():
-    """获取嵌入模型实例"""
-    # 使用智谱AI的嵌入模型
+def get_embedding_model() -> Embeddings:
     return ZhipuEmbeddings(
-        api_key=config.ZHIPU_API_KEY,
-        model=config.EMBEDDING_MODEL
+        api_key=_required(config.ZHIPU_API_KEY, "ZHIPU_API_KEY"),
+        model=config.EMBEDDING_MODEL,
     )
 
 
 @lru_cache()
-def get_vector_store():
-    """获取向量数据库实例"""
-    embeddings = get_embedding_model()
-
-    # 确保向量数据库目录存在
+def get_vector_store() -> Chroma:
     os.makedirs(config.VECTOR_DB_PATH, exist_ok=True)
-
-    # 初始化Chroma向量数据库
-    vector_store = Chroma(
+    return Chroma(
+        collection_name="medical-rag-assistant",
         persist_directory=config.VECTOR_DB_PATH,
-        embedding_function=embeddings
+        embedding_function=get_embedding_model(),
     )
 
-    return vector_store
+
+def has_indexed_documents() -> bool:
+    if not config.embeddings_configured():
+        return False
+    try:
+        payload = get_vector_store().get(limit=1)
+        return bool(payload.get("ids"))
+    except Exception:
+        logger.exception("Unable to inspect vector-store document count")
+        return False
 
 
-def reset_vector_store():
-    """强制重新初始化向量数据库实例（用于清空后）"""
-    logger = logging.getLogger(__name__)
-
-    # 清除lru_cache缓存
-    get_vector_store.cache_clear()
-
-    logger.info("🔄 向量数据库实例缓存已清除，下次调用将重新初始化")
-
-    # 返回新的实例
-    return get_vector_store()
+def clear_vector_store() -> None:
+    if not config.embeddings_configured():
+        return
+    try:
+        get_vector_store().delete_collection()
+    finally:
+        get_vector_store.cache_clear()
 
 
-def get_text_splitter():
-    """获取文本分割器"""
+def get_text_splitter() -> RecursiveCharacterTextSplitter:
     return RecursiveCharacterTextSplitter(
         chunk_size=config.CHUNK_SIZE,
         chunk_overlap=config.CHUNK_OVERLAP,
-        separators=["\n\n", "\n", " ", ""]
+        separators=["\n\n", "\n", " ", ""],
     )
 
 
-def add_documents_to_vector_store(text_content: str, filename: str, file_path: str):
-    """将文档添加到向量数据库"""
-    import logging
-    logger = logging.getLogger(__name__)
+def add_documents_to_vector_store(
+    *,
+    text_content: str,
+    filename: str,
+    document_id: str,
+) -> dict[str, Any]:
+    """Chunk and index one uploaded document without storing internal paths."""
 
     try:
-        logger.info(f"🧠 开始向量化处理: {filename}")
-        logger.info(f"📄 文本长度: {len(text_content)} 字符")
-
-        # 创建文档对象
-        logger.info("📝 创建文档对象...")
         document = Document(
             page_content=text_content,
             metadata={
                 "filename": filename,
-                "file_path": file_path,
-                "source": f"{filename} (uploaded file)"
-            }
+                "document_id": document_id,
+                "source": "uploaded_document",
+            },
         )
-
-        # 分割文档
-        logger.info("✂️ 开始文档分块...")
-        text_splitter = get_text_splitter()
-        chunks = text_splitter.split_documents([document])
-
-        logger.info(f"📦 文档分块完成: {len(chunks)} 个块")
-
-        # 添加到向量数据库
-        logger.info("💾 添加到向量数据库...")
-        vector_store = get_vector_store()
-        vector_store.add_documents(chunks)
-
-        # 持久化
-        logger.info("💿 持久化向量数据库...")
-        vector_store.persist()
-
-        result = {
-            "success": True,
-            "chunks_count": len(chunks),
-            "message": f"成功添加 {len(chunks)} 个文档块到向量数据库"
-        }
-
-        logger.info(f"✅ 向量化完成: {result}")
-        return result
-
-    except Exception as e:
-        logger.error(f"❌ 向量化失败: {str(e)}")
-        import traceback
-        logger.error(f"📋 错误详情: {traceback.format_exc()}")
-        return {
-            "success": False,
-            "error": str(e),
-            "message": "文档向量化失败"
-        }
+        chunks = get_text_splitter().split_documents([document])
+        if not chunks:
+            return {"success": False, "error_code": "no_chunks", "chunks_count": 0}
+        get_vector_store().add_documents(chunks)
+        return {"success": True, "chunks_count": len(chunks)}
+    except Exception:
+        logger.exception("Document indexing failed")
+        return {"success": False, "error_code": "indexing_failed", "chunks_count": 0}
 
 
-def search_relevant_documents(query: str, k: int = None):
-    """搜索相关文档"""
+def search_relevant_documents(query: str, k: int | None = None) -> dict[str, Any]:
     try:
-        if k is None:
-            k = config.MAX_RETRIEVED_DOCS
-
-        vector_store = get_vector_store()
-
-        # 搜索相似文档
-        results = vector_store.similarity_search_with_score(
+        results = get_vector_store().similarity_search_with_score(
             query,
-            k=k
+            k=k or config.MAX_RETRIEVED_DOCS,
         )
-
-        return {
-            "success": True,
-            "documents": results,
-            "count": len(results)
-        }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "documents": []
-        }
+        return {"success": True, "documents": results, "count": len(results)}
+    except Exception:
+        logger.exception("Document retrieval failed")
+        return {"success": False, "documents": [], "count": 0, "error_code": "retrieval_failed"}

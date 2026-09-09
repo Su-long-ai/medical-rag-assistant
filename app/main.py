@@ -1,127 +1,74 @@
-from fastapi import FastAPI, HTTPException
+import logging
+import os
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import uvicorn
-from contextlib import asynccontextmanager
 
-from .routers import chat, upload
 from .config import config
+from .routers import chat, upload
 
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
-    # 启动时的初始化
-    print("🚀 医疗AI助手启动中...")
-
-    # 检查必要的配置
-    if not config.DEEPSEEK_API_KEY:
-        print("⚠️  警告: 未设置 DEEPSEEK_API_KEY")
-
-    try:
-        # 测试Neo4j连接
-        from .deps import get_neo4j_graph
-        graph = get_neo4j_graph()
-        graph.refresh_schema()
-        print("✅ Neo4j 连接成功")
-    except Exception as e:
-        print(f"❌ Neo4j 连接失败: {e}")
-
-
-    print("🎉 医疗AI助手启动完成!")
-    yield
-    # 关闭时的清理
-    print("👋 医疗AI助手正在关闭...")
-
-
-# 创建FastAPI应用
 app = FastAPI(
-    title="医疗AI助手",
-    description="基于DeepSeek和Neo4j的智能医疗问答系统",
-    version="1.0.0",
-    lifespan=lifespan
+    title="Medical RAG Assistant API",
+    description=(
+        "Portfolio/demo backend for document-aware medical information retrieval. "
+        "Not a medical device and not a source of diagnosis or treatment decisions."
+    ),
+    version="2.0.0",
 )
 
-# 配置CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # Vue开发服务器地址
+    allow_origins=list(config.CORS_ORIGINS),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-# 注册路由
 app.include_router(chat.router)
 app.include_router(upload.router)
 
 
 @app.get("/")
-async def root():
-    """根路径"""
+async def root() -> dict:
     return {
-        "message": "医疗AI助手API服务",
-        "version": "1.0.0",
-        "status": "running",
-        "endpoints": {
-            "chat": "/api/chat",
-            "upload": "/api/upload",
-            "docs": "/docs"
-        }
+        "name": "Medical RAG Assistant API",
+        "version": "2.0.0",
+        "docs": "/docs",
+        "health": "/health",
+        "disclaimer": "Informational software only; not a medical device.",
     }
 
 
 @app.get("/health")
-async def health_check():
-    """健康检查"""
-    try:
-        # 检查各个组件状态
-        status = {
-            "api": "healthy",
-            "deepseek": "unknown",
-            "neo4j": "unknown",
-            "embedding": "unknown"
-        }
+async def health_check() -> dict:
+    """Side-effect-free readiness summary; does not call external services."""
 
-        # 检查DeepSeek API
-        try:
-            from .deps import get_llm
-            llm = get_llm()
-            status["deepseek"] = "healthy"
-        except Exception as e:
-            status["deepseek"] = f"error: {str(e)}"
-
-        # 检查Neo4j
-        try:
-            from .deps import get_neo4j_graph
-            graph = get_neo4j_graph()
-            graph.query("RETURN 1 as test")
-            status["neo4j"] = "healthy"
-        except Exception as e:
-            status["neo4j"] = f"error: {str(e)}"
-
-        # 检查嵌入模型
-        try:
-            from .deps import get_embedding_model
-            embedding_model = get_embedding_model()
-            status["embedding"] = "healthy"
-        except Exception as e:
-            status["embedding"] = f"error: {str(e)}"
-
-        return {"status": "healthy", "components": status}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"健康检查失败: {str(e)}")
+    return {
+        "status": "ok",
+        "configuration": {
+            "llm_configured": config.llm_configured(),
+            "embeddings_configured": config.embeddings_configured(),
+            "web_search_enabled": config.ENABLE_WEB_SEARCH,
+            "graph_tool_enabled": config.ENABLE_GRAPH_TOOL,
+            "admin_endpoints_enabled": config.ENABLE_ADMIN_ENDPOINTS,
+        },
+    }
 
 
 @app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    """全局异常处理"""
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled request error: %s %s", request.method, request.url.path)
     return JSONResponse(
         status_code=500,
         content={
-            "error": "内部服务器错误",
-            "detail": str(exc),
-            "path": str(request.url)
-        }
+            "error": "internal_server_error",
+            "message": "The request could not be completed.",
+        },
     )

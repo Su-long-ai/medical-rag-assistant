@@ -1,56 +1,66 @@
 # Medical RAG Assistant API
 
-A FastAPI backend for document-aware medical question answering. The project combines file ingestion, retrieval-augmented generation (RAG), optional OCR, conversational sessions and Neo4j-backed knowledge-graph tools behind a streaming API.
+A **FastAPI + RAG portfolio backend** for document-aware medical information retrieval. It combines bounded file ingestion, Chroma retrieval, deterministic query routing, optional current-information search, optional read-only Neo4j lookup and SSE response delivery.
 
-This repository is a technical portfolio project. It is **not a medical device** and must not be used as a source of diagnosis or treatment decisions.
+> This is informational software and a portfolio/demo project. It is **not a medical device** and should not be used for diagnosis or treatment decisions.
 
-## Highlights
+## What changed in the v2 refactor
 
-- FastAPI backend with automatic OpenAPI documentation
-- PDF, DOCX and TXT uploads
-- text extraction with OCR fallback for scanned PDFs
-- document chunking and Chroma-based retrieval
-- configurable LLM providers
-- Neo4j knowledge-graph integration
-- streaming chat responses
-- multi-session conversation history
-- upload/status management endpoints
-- local secret, upload and vector-store hygiene through `.gitignore`
+The original prototype demonstrated a broad stack, but several implementation details weakened its credibility as a public portfolio project. v2 fixes the important ones:
+
+- removed hard-coded `medical_analysis` confidence/score values;
+- stopped returning internal file paths and extracted document text from upload responses;
+- stores uploads under opaque document IDs instead of user filenames;
+- replaced a deprecated free-form LangChain agent loop with deterministic route-and-synthesize orchestration;
+- fixed a routing bug where ordinary questions could ignore uploaded documents unless the prompt explicitly mentioned “the document”;
+- replaced LLM-generated Cypher with a parameterized read-only Neo4j lookup;
+- removed wildcard CORS headers from the SSE route and centralized CORS policy;
+- made health checks side-effect-free instead of calling external services;
+- disabled destructive/debug endpoints by default;
+- added upload-size/PDF-page bounds and offline tests.
 
 ## Architecture
 
 ```text
-uploaded document
-      │
-      ▼
-text extraction ── OCR fallback
-      │
-      ▼
-chunking + embeddings
-      │
-      ▼
-  vector retrieval ─────────────┐
-                               │
-user question ─► chat service ─┼─► agent / LLM ─► streaming response
-                               │
-                 Neo4j graph ──┘
+PDF / DOCX / TXT
+      |
+      v
+upload policy -> opaque local document ID -> text extraction -> OCR fallback
+      |                                                |
+      +----------------------------------------------> chunking -> Chroma
+
+user question
+      |
+      v
+deterministic query policy
+   | document       | time-sensitive       | graph intent      | direct
+   v                v                      v                   v
+Chroma RAG       web adapter       read-only Neo4j lookup     none
+   \_____________________|______________________|_______________/
+                         |
+                         v
+                 evidence-aware LLM
+                         |
+                         v
+               SSE status/meta/chunks
 ```
 
-## Repository layout
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design rationale.
 
-```text
-app/
-├── agents/       agent prompts, callbacks and medical-agent logic
-├── routers/      chat and upload API routes
-├── schemas/      Pydantic request/response models
-├── services/     chat, file and session services
-├── config.py     environment-based configuration
-├── deps.py       shared integrations and dependency helpers
-└── main.py       FastAPI application
-run.py            development launcher
-requirements.txt  Python dependencies
-.env.example      configuration template
-```
+## Core features
+
+- FastAPI backend and OpenAPI docs
+- PDF, DOCX and TXT ingestion
+- pypdf extraction with bounded Tesseract/PyMuPDF OCR fallback
+- Chroma vector retrieval with metadata that excludes local paths
+- deterministic routing between document RAG, web context, graph context and direct response
+- DeepSeek or OpenAI-compatible chat model configuration
+- optional Tavily current-information search
+- optional parameterized read-only Neo4j entity/relationship lookup
+- bounded in-memory multi-session history
+- Server-Sent Events for incremental status, source metadata and answer chunks
+- environment-only credentials and privacy-focused public response schemas
+- unit tests for policy and safety boundaries
 
 ## Quick start
 
@@ -63,98 +73,83 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Create local configuration:
-
-```bash
-# Windows PowerShell
-Copy-Item .env.example .env
-
-# Linux/macOS
-cp .env.example .env
-```
-
-Fill in only the services you intend to use. The template includes:
+Copy `.env.example` to `.env`, then configure at minimum:
 
 ```text
-DEEPSEEK_API_KEY
-MOONSHOT_API_KEY
-ZHIPU_API_KEY
-TAVILY_API_KEY
-NEO4J_URI
-NEO4J_USERNAME
-NEO4J_PASSWORD
-EMBEDDING_MODEL
+DEEPSEEK_API_KEY=...
+ZHIPU_API_KEY=...
 ```
 
-Start the API:
+Start the development server:
 
 ```bash
 python run.py
 ```
 
-or directly:
+Then open `http://127.0.0.1:8000/docs`.
 
-```bash
-uvicorn app.main:app --reload
-```
+## Query routing
 
-Open the interactive API documentation at:
+Routing is intentionally deterministic and covered by tests:
 
-```text
-http://127.0.0.1:8000/docs
-```
+1. explicit document intent + indexed documents -> document RAG;
+2. explicitly time-sensitive/latest question -> configured web-search route;
+3. otherwise, if uploaded documents exist -> document RAG;
+4. explicit graph/relationship intent with no indexed documents -> read-only graph route;
+5. otherwise -> direct informational response.
 
-## Main API routes
+This makes it possible to explain and test why a query used a given evidence source.
 
-### Chat
-
-```text
-POST /api/chat/stream
-GET  /api/chat/history/{session_id}
-POST /api/chat/clear
-GET  /api/chat/sessions
-POST /api/chat/test-kg
-```
-
-### Uploads
+## API routes
 
 ```text
 POST /api/upload/file
 GET  /api/upload/supported-formats
 GET  /api/upload/uploads-status
-POST /api/upload/clear-uploads
+POST /api/upload/clear-uploads      # disabled by default
+
+POST /api/chat/stream
+GET  /api/chat/history/{session_id}
+POST /api/chat/clear
+GET  /api/chat/sessions             # disabled by default
+POST /api/chat/test-kg              # disabled by default
+
+GET  /
+GET  /health
 ```
 
-### Service
+The `/api/chat/stream` endpoint uses SSE. The stream contains `status`, `meta`, `chunk`, `done` or `error` events. This is incremental HTTP delivery, not a claim of provider-level token streaming.
 
-```text
-GET /
-GET /health
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+ruff check app tests
+python -m compileall -q app run.py
 ```
 
-## External services
+The repository includes tests for:
 
-Depending on the features you enable, the application can use:
+- document-aware query routing;
+- time-sensitive route precedence;
+- path-traversal-resistant filename handling;
+- upload size/type limits;
+- bounded session history;
+- graph/web tool isolation;
+- public upload-schema privacy boundaries.
 
-- an LLM provider configured through environment variables
-- Neo4j for graph-backed tools
-- Chroma for local vector retrieval
-- Tesseract for OCR of scanned documents
+A GitHub Actions workflow template is included at `docs/github-actions-ci.example.yml`. It can be moved to `.github/workflows/ci.yml` when the publishing token has GitHub `workflow` scope.
 
-Tesseract is a host dependency and is not installed by `pip`.
+## Security and data boundaries
 
-## Data and security
+By default, graph search, web search and destructive/debug endpoints are disabled. Public API responses do not return internal upload paths or extracted document text. See [`docs/SECURITY_PRIVACY.md`](docs/SECURITY_PRIVACY.md).
 
-- API keys and database credentials belong in `.env`, never in source code.
-- `.env`, uploads, vector-store data, caches and local runtime artifacts are excluded from Git.
-- Do not upload personal medical records to a shared/public deployment.
-- Add authentication, authorization, rate limiting and deployment hardening before exposing the API outside a trusted development environment.
+Do not upload real personal medical records to a shared/public instance. An internet-facing deployment needs authentication, per-user isolation, rate limiting, encrypted storage, retention/deletion controls and a deployment-specific threat model.
 
-## Limitations
+## Research / product limitations
 
-RAG and knowledge graphs can improve grounding, but they do not eliminate hallucinations, stale information, extraction errors or retrieval failures. OCR quality also depends on scan quality and language support.
-
-Any health-related output should be treated as informational software output, not professional medical advice.
+This repository does **not** contain evidence of clinical accuracy, diagnostic performance, retrieval benchmark superiority or human-subject validation. RAG can improve grounding but cannot guarantee correctness, freshness or completeness. OCR and retrieval can fail, and external search results can be low quality.
 
 ## License
 

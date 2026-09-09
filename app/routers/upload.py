@@ -1,153 +1,91 @@
-"""
-文件上传和文件管理路由
-"""
-from fastapi import APIRouter, UploadFile, File, HTTPException
-import os
 import logging
+from typing import Annotated
 
-from ..schemas.file import FileUploadResponse
-from ..services import FileService
+from fastapi import APIRouter, File, HTTPException, UploadFile, status
+
 from ..config import config
+from ..deps import clear_vector_store
+from ..schemas.file import FileUploadResponse, UploadStatusResponse
+from ..services.file_service import FileService
+from ..services.upload_policy import UploadPolicyError, validate_upload
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-router = APIRouter(prefix="/api/upload", tags=["文件上传"])
-
-# 全局服务实例
+router = APIRouter(prefix="/api/upload", tags=["uploads"])
 file_service = FileService()
 
 
 @router.post("/file", response_model=FileUploadResponse)
-async def upload_file(file: UploadFile = File(...)):
-    """文件上传接口"""
+async def upload_file(file: Annotated[UploadFile, File(...)]) -> FileUploadResponse:
+    filename = file.filename or ""
+    content = await file.read(config.MAX_FILE_SIZE + 1)
     try:
-        logger.info(f"🚀 开始处理文件上传: {file.filename}")
+        validate_upload(
+            filename,
+            len(content),
+            allowed_extensions=config.ALLOWED_EXTENSIONS,
+            max_size_bytes=config.MAX_FILE_SIZE,
+        )
+    except UploadPolicyError as exc:
+        http_status = (
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+            if exc.code == "file_too_large"
+            else status.HTTP_400_BAD_REQUEST
+        )
+        raise HTTPException(
+            status_code=http_status,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
 
-        # 验证文件扩展名
-        file_ext = os.path.splitext(file.filename)[1].lower()
-        logger.info(f"📁 文件扩展名: {file_ext}")
+    if not config.embeddings_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "embeddings_not_configured",
+                "message": "Configure the embedding provider before indexing documents.",
+            },
+        )
 
-        if file_ext not in config.ALLOWED_EXTENSIONS:
-            logger.error(f"❌ 不支持的文件类型: {file_ext}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"不支持的文件类型: {file_ext}。支持的类型: {', '.join(config.ALLOWED_EXTENSIONS)}"
-            )
+    result = await file_service.process_file(content, filename)
+    if not result.get("success"):
+        return FileUploadResponse(
+            success=False,
+            filename=result.get("filename", filename),
+            message=result.get("message", "The document could not be processed."),
+            error_code=result.get("error_code", "processing_failed"),
+        )
 
-        # 读取文件内容
-        logger.info("📖 开始读取文件内容...")
-        file_content = await file.read()
-        logger.info(f"📊 文件大小: {len(file_content)} bytes ({len(file_content)/1024:.2f} KB)")
-
-        # 验证文件大小
-        if len(file_content) > config.MAX_FILE_SIZE:
-            logger.error(f"❌ 文件大小超过限制: {len(file_content)} > {config.MAX_FILE_SIZE}")
-            raise HTTPException(
-                status_code=413,
-                detail=f"文件大小超过限制 ({config.MAX_FILE_SIZE / 1024 / 1024:.1f}MB)"
-            )
-
-        # 处理文件
-        logger.info("🔄 开始处理文件（提取文本 + RAG向量化）...")
-        result = await file_service.process_file(file_content, file.filename)
-
-        logger.info(f"✅ 文件处理完成，结果: {result.get('success', False)}")
-
-        if result["success"]:
-            text_length = result.get('text_length', 0)
-            rag_info = result.get('rag_info', {})
-            file_path = result.get('file_path', '')
-
-            logger.info(f"📝 文本提取成功: {text_length} 字符")
-            logger.info(f"🧠 RAG处理状态: {rag_info.get('success', False)}")
-            logger.info(f"📦 文档分块数量: {rag_info.get('chunks_count', 0)}")
-            logger.info(f"💬 RAG处理消息: {rag_info.get('message', '')}")
-
-            # 构建详细的响应消息
-            if rag_info.get('success'):
-                chunks_count = rag_info.get('chunks_count', 0)
-                message = f"文件上传成功并完成RAG处理，已分割为 {chunks_count} 个文档块可供检索"
-            else:
-                message = "文件上传成功，但RAG处理失败"
-
-            return FileUploadResponse(
-                success=True,
-                filename=file.filename,
-                message=message,
-                text_length=result["text_length"],
-                file_path=file_path,
-                rag_info=rag_info,
-                medical_analysis=result.get("medical_analysis", {})
-            )
-        else:
-            error_msg = result.get('error', '未知错误')
-            logger.error(f"❌ 文件处理失败: {error_msg}")
-            return FileUploadResponse(
-                success=False,
-                filename=file.filename,
-                message="文件处理失败",
-                error=result["error"]
-            )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"💥 服务器内部错误: {str(e)}")
-        import traceback
-        logger.error(f"📋 错误详情: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
-
-
+    return FileUploadResponse(
+        success=True,
+        filename=result["filename"],
+        message="Document indexed successfully.",
+        document_id=result["document_id"],
+        text_length=result["text_length"],
+        rag_info=result["rag_info"],
+    )
 
 
 @router.get("/supported-formats")
-async def get_supported_formats():
-    """获取支持的文件格式"""
+async def get_supported_formats() -> dict:
     return {
-        "supported_extensions": list(config.ALLOWED_EXTENSIONS),
-        "max_file_size_mb": config.MAX_FILE_SIZE / 1024 / 1024
+        "supported_extensions": sorted(config.ALLOWED_EXTENSIONS),
+        "max_file_size_mb": round(config.MAX_FILE_SIZE / 1024 / 1024, 2),
+        "max_pdf_pages": config.MAX_PDF_PAGES,
     }
 
 
-@router.get("/uploads-status")
-async def get_uploads_status():
-    """获取uploads目录状态"""
-    try:
-        logger.info("📊 获取uploads目录状态请求")
-
-        status = file_service.get_uploads_status()
-
-        return {
-            "file_count": status.get("file_count", 0),
-            "files": status.get("files", []),
-            "total_size": status.get("total_size", "0B"),
-            "directory_path": config.UPLOAD_DIR
-        }
-
-    except Exception as e:
-        logger.error(f"❌ 获取uploads目录状态失败: {e}")
-        raise HTTPException(status_code=500, detail=f"获取uploads目录状态失败: {str(e)}")
+@router.get("/uploads-status", response_model=UploadStatusResponse)
+async def get_uploads_status() -> UploadStatusResponse:
+    return UploadStatusResponse(**file_service.get_uploads_status())
 
 
 @router.post("/clear-uploads")
-async def clear_uploads():
-    """清空uploads目录中的所有文件"""
-    try:
-        logger.info("🗑️ 收到清空uploads目录请求")
-
-        result = file_service.clear_uploads_directory()
-
-        return {
-            "success": result.get("success", False),
-            "message": result.get("message", "清空uploads目录操作完成"),
-            "deleted_count": result.get("deleted_count", 0),
-            "deleted_files": result.get("deleted_files", [])
-        }
-
-    except Exception as e:
-        logger.error(f"❌ 清空uploads目录失败: {e}")
-        raise HTTPException(status_code=500, detail=f"清空uploads目录失败: {str(e)}")
-
-
+async def clear_uploads() -> dict:
+    if not config.ENABLE_ADMIN_ENDPOINTS:
+        raise HTTPException(status_code=403, detail="Admin endpoints are disabled.")
+    result = file_service.clear_uploads_directory()
+    clear_vector_store()
+    return {
+        "success": True,
+        "deleted_count": result["deleted_count"],
+        "message": "Uploads and the local vector index were cleared.",
+    }

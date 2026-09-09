@@ -1,8 +1,5 @@
-"""
-服务层初始化
-"""
-from .chat_service import MedicalChatService
-from .file_service import FileService
-from .session_service import SessionManager
+"""Service-layer package.
 
-__all__ = ['MedicalChatService', 'FileService', 'SessionManager']
+Modules are intentionally not re-exported here to avoid import-time coupling
+between routing policy, chat orchestration and agent adapters.
+"""
