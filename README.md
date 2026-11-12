@@ -151,6 +151,10 @@ Do not upload real personal medical records to a shared/public instance. An inte
 
 This repository does **not** contain evidence of clinical accuracy, diagnostic performance, retrieval benchmark superiority or human-subject validation. RAG can improve grounding but cannot guarantee correctness, freshness or completeness. OCR and retrieval can fail, and external search results can be low quality.
 
+## Scoped engineering discussions
+
+For a bounded, evidence-based discussion of RAG retrieval quality, document-source tracing, or Python regression testing, see [the collaboration inquiry guide](docs/SCOPED_COLLABORATION.md). This is an engineering portfolio, not a commercial deployment or medical product. Please use only synthetic or public examples in GitHub issues; do not post private documents, API keys or medical information.
+
 ## License
 
 MIT License. See `LICENSE`.
