@@ -30,6 +30,6 @@ If you have an **open-source, non-sensitive** question, [open a GitHub issue](ht
 - the affected component (ingestion, routing, retrieval, citations, API, etc.);
 - whether you want an engineering discussion, a bounded review, or a contribution.
 
-For non-public business inquiries, first use a contact method explicitly made available by the repository owner's GitHub profile; **do not place proprietary documents, personal information, API keys, medical records, or confidential business data in public GitHub issues**.
+If the topic might require a private conversation, you may open an issue containing only a **non-sensitive one-sentence request to coordinate a private channel**; do not include a company name unless you choose to disclose it. **Never place proprietary documents, personal information, API keys, medical records, or confidential business data in public GitHub issues.** The public profile does not necessarily provide a private contact method.
 
 This page is an invitation to discuss a narrowly defined engineering problem, **not** a guarantee of availability, price, delivery, or a request to upload confidential material.
