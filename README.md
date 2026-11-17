@@ -1,6 +1,13 @@
 # Medical RAG Assistant API
 
-A **FastAPI + RAG portfolio backend** for document-aware medical information retrieval. It combines bounded file ingestion, Chroma retrieval, deterministic query routing, optional current-information search, optional read-only Neo4j lookup and SSE response delivery.
+**Applied AI / RAG portfolio backend:** FastAPI document ingestion + Chroma retrieval + deterministic query routing + optional read-only Neo4j/web context + SSE streaming.
+
+**Recruiter quick scan**
+- bounded PDF/DOCX/TXT ingestion with OCR fallback
+- deterministic routing between document RAG, current-information context, graph lookup and direct response
+- evidence-aware LLM synthesis with streaming delivery
+- parameterized read-only Neo4j access instead of free-form generated Cypher
+- offline tests and explicit privacy / safety boundaries
 
 > This is informational software and a portfolio/demo project. It is **not a medical device** and should not be used for diagnosis or treatment decisions.
 
