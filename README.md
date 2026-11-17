@@ -8,6 +8,7 @@
 - evidence-aware LLM synthesis with streaming delivery
 - parameterized read-only Neo4j access instead of free-form generated Cypher
 - offline tests and explicit privacy / safety boundaries
+- **Verification:** 17/17 public tests pass; `ruff check app tests` passes
 
 > This is informational software and a portfolio/demo project. It is **not a medical device** and should not be used for diagnosis or treatment decisions.
 
